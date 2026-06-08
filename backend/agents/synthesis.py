@@ -50,4 +50,4 @@ class SynthesisAgent:
 
         response = self.llm.invoke([system, human])
         return response.content
-    
+ 
