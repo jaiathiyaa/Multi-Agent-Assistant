@@ -1,4 +1,11 @@
 from contextlib import asynccontextmanager
+from typing import List
+from uuid import UUID
+
+from aiohttp import payload
+from cuda.bindings.nvml import UUIDType
+from werkzeug import security
+
 from auth.auth import verify_token, create_access_token
 import jwt
 import uvicorn
@@ -7,7 +14,7 @@ from passlib.context import CryptContext
 from fastapi import FastAPI, HTTPException, Depends
 from models.database import engine, create_db_and_tables
 from sqlmodel import Session, select
-from models.model import User, UserRead, UserCreate, UserLogin
+from models.model import User, UserRead, UserCreate, UserLogin, SessionRead, SessionCreate , DBSession
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -57,15 +64,57 @@ def login_user(user: UserLogin):
         access_token = create_access_token(
             {
                 "sub":db_user.email,
-                "user_id":db_user.id,
+                "user_id":str(db_user.id),
                 "username":db_user.username,
             }
         )
         return {"access_token":access_token, "token_type":"bearer"}
 
-
-
 security = HTTPBearer()
+
+@app.post("/sessions",response_model=SessionRead)
+def create_session(session_data : SessionCreate,credentials : HTTPAuthorizationCredentials = Depends(security)):
+    payload = verify_token(credentials.credentials)
+    with Session(engine) as db:
+        session_obj = DBSession(
+            user_id=payload["user_id"],
+            title= session_data.title
+        )
+        db.add(session_obj)
+        db.commit()
+        db.refresh(session_obj)
+        return session_obj
+
+
+
+@app.get("/sessions",response_model=List[SessionRead])
+def get_sessions(credentials : HTTPAuthorizationCredentials = Depends(security)):
+    payload=verify_token(credentials.credentials)
+    with Session(engine) as db:
+        sessions = db.exec(select(DBSession).where(DBSession.user_id == payload["user_id"])).all()
+        return sessions
+
+@app.get("/sessions/{session_id}",response_model=SessionRead)
+def get_session(session_id: UUID , credentials : HTTPAuthorizationCredentials = Depends(security)):
+    payload = verify_token(credentials.credentials)
+    with Session(engine) as db:
+        session_obj = db.exec(select(DBSession).where(DBSession.user_id == payload["user_id"] , DBSession.id == session_id)).first()
+        if not session_obj:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return session_obj
+
+@app.delete("/sessions/{session_id}")
+def delete_session(session_id: UUID,credentials : HTTPAuthorizationCredentials = Depends(security)):
+    payload = verify_token(credentials.credentials)
+    with Session(engine) as db:
+        session_obj = db.exec(select(DBSession).where(DBSession.user_id == payload["user_id"] , DBSession.id == session_id)).first()
+        if not session_obj:
+            raise HTTPException(status_code=404, detail="Session not found")
+        db.delete(session_obj)
+        db.commit()
+        return {
+            "message" : "Session deleted successfully"
+        }
 
 @app.get("/profile")
 def get_profile(
