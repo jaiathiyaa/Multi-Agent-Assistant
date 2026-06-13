@@ -36,8 +36,18 @@ class DBSession(SQLModel,table=True):
     user_id : UUID = Field(foreign_key="users.id",index=True)
     created_at : datetime = Field(default_factory=lambda : datetime.now(timezone.utc),index=True)
     title : str = Field(index=True,max_length=255,default="New Session")
-    documents : list["Document"] = Relationship(back_populates="session")
-    queries : list["Query"] = Relationship(back_populates="session")
+    documents: list["Document"] = Relationship(
+        back_populates="session",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan"
+        }
+    )
+    queries: list["Query"] = Relationship(
+        back_populates="session",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan"
+        }
+    )
     user : User = Relationship(back_populates="sessions")
 
 class Document(SQLModel,table=True):
@@ -45,45 +55,83 @@ class Document(SQLModel,table=True):
     id : UUID = Field(default_factory=uuid4,primary_key=True)
     session_id : UUID = Field(foreign_key="sessions.id",index=True)
     filename : str = Field(max_length=255)
-    chunk_count : int
+    file_path : str = Field(max_length=500)
+    chunk_count: int = Field(default=0)
     uploaded_at : datetime = Field(default_factory=lambda : datetime.now(timezone.utc),index=True)
-    collection_name : str = Field(max_length=255)
     session: DBSession = Relationship(
         back_populates="documents"
     )
 
-class Query(SQLModel,table=True):
+class Query(SQLModel, table=True):
     __tablename__ = "queries"
-    id : UUID = Field(default_factory=uuid4,primary_key=True)
-    session_id : UUID = Field(foreign_key="sessions.id",index=True)
-    question : str = Field(sa_column=Column(Text,nullable=False))
-    final_answer : str = Field(sa_column=Column(Text,nullable=False))
-    confidence_score : Decimal = Field(sa_column=Column(Numeric(5,2),nullable=False))
-    unsupported_claims : list[str] = Field(default_factory=list,sa_column=Column(ARRAY(Text),nullable=False))
-    sources_used : dict = Field(default_factory=dict,sa_column=Column(JSONB,nullable=False))
-    created_at : datetime = Field(default_factory=lambda : datetime.now(timezone.utc),index=True)
-    session : DBSession = Relationship(back_populates="queries")
+    id: UUID = Field(
+        default_factory=uuid4,
+        primary_key=True
+    )
+    session_id: UUID = Field(
+        foreign_key="sessions.id",
+        index=True
+    )
+    question: str = Field(
+        sa_column=Column(Text, nullable=False)
+    )
+    route: str = Field(
+        max_length=50
+    )
+    rag_confidence: float = Field(
+        default=0.0
+    )
+    rag_context: str | None = Field(
+        default=None,
+        sa_column=Column(Text)
+    )
+    web_context: str | None = Field(
+        default=None,
+        sa_column=Column(Text)
+    )
+    synthesized_answer: str = Field(
+        default="",
+        sa_column=Column(Text)
+    )
 
+    critique: str = Field(
+        default="",
+        sa_column=Column(Text)
+    )
+
+    final_answer: str = Field(
+        default="",
+        sa_column=Column(Text)
+    )
+    sources_used: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB)
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        index=True
+    )
+    session: "DBSession" = Relationship(
+        back_populates="queries"
+    )
 class SessionCreate(SQLModel):
     title : str = Field(default="New Session")
 
-class DocumentCreate(SQLModel):
-    session_id : UUID
-    filename : str
-    collection_name : str
 
 class QueryCreate(SQLModel):
     session_id : UUID
     question : str
 
 class QueryResponse(SQLModel):
-    id : UUID
-    question : str
-    final_answer : str
-    confidence_score : Decimal
-    unsupported_claims : list[str]
-    sources_used : dict
-    created_at : datetime
+    id: UUID
+    question: str
+    route: str
+    rag_confidence: float
+    final_answer: str
+    critique: str
+    synthesized_answer : str
+    sources_used: dict
+    created_at: datetime
 
 class SessionRead(SQLModel):
     id: UUID
