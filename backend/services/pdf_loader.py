@@ -128,8 +128,19 @@ class RagGenerator:
             name=session_id
         )
 
-        collection.delete(
-            where={
-                "document_id": document_id
-            }
+        before = collection.get(
+            where={"document_id": document_id}
         )
+
+        print(f"Chunks before delete: {len(before['ids'])}")
+
+        collection.delete(
+            where={"document_id": document_id}
+        )
+
+        after = collection.get(
+            where={"document_id": document_id}
+        )
+
+        print(f"Chunks after delete: {len(after['ids'])}")
+

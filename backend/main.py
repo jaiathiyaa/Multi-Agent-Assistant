@@ -2,9 +2,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
 from uuid import UUID
-
+import shutil
 from agents.supervisor import Supervisor
-from services.pdf_loader import RagGenerator
+from services.pdf_loader import RagGenerator, VECTOR_STORE_PATH
 from auth.auth import verify_token, create_access_token
 import uvicorn
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -16,6 +16,7 @@ from models.model import User, UserRead, UserCreate, UserLogin, SessionRead, Ses
     Document, Query, QueryCreate, QueryResponse
 # from services.rag_singleton import rag_instance as rag
 from services.rag_service import get_rag_instance
+import sqlite3
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 UPLOAD_DIR = Path("uploads")
@@ -36,6 +37,30 @@ supervisor = Supervisor()
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
+
+def get_segment_dir(session_id: str):
+
+    db_file = VECTOR_STORE_PATH / "chroma.sqlite3"
+
+    with sqlite3.connect(db_file) as conn:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT s.id
+            FROM collections c
+            JOIN segments s
+                ON c.id = s.collection
+            WHERE c.name = ?
+            AND s.type = 'urn:chroma:segment/vector/hnsw-local-persisted'
+        """, (session_id,))
+
+        row = cursor.fetchone()
+
+    if row:
+        return VECTOR_STORE_PATH / row[0]
+
+    return None
 
 # User SignUp
 @app.post("/signup",response_model=UserRead,status_code=201)
@@ -108,17 +133,73 @@ def get_session(session_id: UUID , credentials : HTTPAuthorizationCredentials = 
             raise HTTPException(status_code=404, detail="Session not found")
         return session_obj
 
+
+
 @app.delete("/sessions/{session_id}")
-def delete_session(session_id: UUID,credentials : HTTPAuthorizationCredentials = Depends(security)):
+def delete_session(
+    session_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
     payload = verify_token(credentials.credentials)
+
     with Session(engine) as db:
-        session_obj = db.exec(select(DBSession).where(DBSession.user_id == payload["user_id"] , DBSession.id == session_id)).first()
+
+        session_obj = db.exec(
+            select(DBSession).where(
+                DBSession.user_id == payload["user_id"],
+                DBSession.id == session_id
+            )
+        ).first()
+
         if not session_obj:
-            raise HTTPException(status_code=404, detail="Session not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Session not found"
+            )
+
+        documents = db.exec(
+            select(Document).where(
+                Document.session_id == session_id
+            )
+        ).all()
+
+        segment_dir = get_segment_dir(
+            str(session_id)
+        )
+
+        try:
+            get_rag_instance().client.delete_collection(
+                name=str(session_id)
+            )
+        except Exception as e:
+            print(f"Collection deletion error: {e}")
+
+        if segment_dir and segment_dir.exists():
+            try:
+                shutil.rmtree(segment_dir)
+                print(f"Deleted segment dir: {segment_dir}")
+            except Exception as e:
+                print(f"Segment deletion error: {e}")
+
+        for doc in documents:
+
+            try:
+                file_path = Path(doc.file_path)
+
+                if file_path.exists():
+                    file_path.unlink()
+
+            except Exception as e:
+                print(f"File deletion error: {e}")
+
+            db.delete(doc)
+
         db.delete(session_obj)
+
         db.commit()
+
         return {
-            "message" : "Session deleted successfully"
+            "message": "Session deleted successfully"
         }
 
 @app.post("/documents/uploads",response_model=DocumentRead)
@@ -187,10 +268,17 @@ def get_documents(session_id : UUID ,credentials : HTTPAuthorizationCredentials 
         doc = db.exec(select(Document).where(Document.session_id == session_id)).all()
         return doc
 
+from pathlib import Path
+
 @app.delete("/documents/{document_id}")
-def delete_document(document_id: UUID ,credentials : HTTPAuthorizationCredentials = Depends(security)):
+def delete_document(
+    document_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
     payload = verify_token(credentials.credentials)
+
     with Session(engine) as db:
+
         doc = db.exec(
             select(Document)
             .join(DBSession)
@@ -199,16 +287,56 @@ def delete_document(document_id: UUID ,credentials : HTTPAuthorizationCredential
                 DBSession.user_id == payload["user_id"]
             )
         ).first()
+
         if not doc:
-            raise HTTPException(status_code=404,detail="Document Not Found")
+            raise HTTPException(
+                status_code=404,
+                detail="Document Not Found"
+            )
+
+        session_id = str(doc.session_id)
+
+        segment_dir = get_segment_dir(
+            session_id
+        )
+
         get_rag_instance().delete_document_chunks(
-            str(doc.session_id),
+            session_id,
             str(doc.id)
         )
+
+        try:
+            file_path = Path(doc.file_path)
+
+            if file_path.exists():
+                file_path.unlink()
+
+        except Exception as e:
+            print(f"File deletion error: {e}")
+
+        try:
+            collection = get_rag_instance().client.get_collection(
+                name=session_id
+            )
+
+            if collection.count() == 0:
+
+                get_rag_instance().client.delete_collection(
+                    name=session_id
+                )
+
+                if segment_dir and segment_dir.exists():
+                    shutil.rmtree(segment_dir)
+
+        except Exception:
+            # Collection may already be deleted
+            pass
+
         db.delete(doc)
         db.commit()
+
         return {
-            "message" : "Document deleted successfully"
+            "message": "Document deleted successfully"
         }
 
 @app.post("/query", response_model=QueryResponse)
