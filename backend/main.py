@@ -3,10 +3,14 @@ from pathlib import Path
 from typing import List
 from uuid import UUID
 import shutil
+
+from starlette.middleware.cors import CORSMiddleware
+
 from agents.supervisor import Supervisor
 from services.pdf_loader import RagGenerator, VECTOR_STORE_PATH
 from auth.auth import verify_token, create_access_token
 import uvicorn
+from datetime import datetime, timezone
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from passlib.context import CryptContext
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
@@ -30,6 +34,13 @@ async def lifespan(app: FastAPI):
     print("Shutting Down...")
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # Your frontend URLs
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods including OPTIONS
+    allow_headers=["*"],  # Allows all headers
+)
 supervisor = Supervisor()
 
 
@@ -422,6 +433,203 @@ def get_profile(
             status_code=401,
             detail=str(e)
         )
+
+
+
+# ─────────────────────────────────────────────
+# 1. Document Embedding Status
+# ─────────────────────────────────────────────
+@app.get("/documents/{document_id}/status")
+def get_document_status(
+    document_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    payload = verify_token(credentials.credentials)
+
+    with Session(engine) as db:
+        doc = db.exec(
+            select(Document)
+            .join(DBSession)
+            .where(
+                Document.id == document_id,
+                DBSession.user_id == payload["user_id"]
+            )
+        ).first()
+
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Check actual chunk count in ChromaDB
+        try:
+            collection = get_rag_instance().client.get_collection(
+                name=str(doc.session_id)
+            )
+            result = collection.get(
+                where={"document_id": str(document_id)}
+            )
+            indexed_chunks = len(result["ids"])
+            is_indexed = indexed_chunks > 0
+        except Exception:
+            indexed_chunks = 0
+            is_indexed = False
+
+        return {
+            "document_id": str(document_id),
+            "filename": doc.filename,
+            "status": "indexed" if is_indexed else "not_indexed",
+            "chunk_count_db": doc.chunk_count,       # what was saved to DB at upload time
+            "chunk_count_vector": indexed_chunks,     # live count from ChromaDB
+            "is_indexed": is_indexed
+        }
+
+
+# ─────────────────────────────────────────────
+# 2. Session Query History
+# ─────────────────────────────────────────────
+@app.get("/sessions/{session_id}/queries")
+def get_session_queries(
+    session_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    payload = verify_token(credentials.credentials)
+
+    with Session(engine) as db:
+        # Ownership check
+        session_obj = db.exec(
+            select(DBSession).where(
+                DBSession.id == session_id,
+                DBSession.user_id == payload["user_id"]
+            )
+        ).first()
+
+        if not session_obj:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        queries = db.exec(
+            select(Query).where(Query.session_id == session_id)
+        ).all()
+
+        return queries   # serialises via QueryResponse model automatically
+
+
+# ─────────────────────────────────────────────
+# 3. Query Routing Trace (Supervisor Debug)
+# ─────────────────────────────────────────────
+@app.get("/queries/{query_id}/trace")
+def get_query_trace(
+    query_id: UUID,
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    payload = verify_token(credentials.credentials)
+
+    with Session(engine) as db:
+        query_record = db.exec(
+            select(Query)
+            .join(DBSession)
+            .where(
+                Query.id == query_id,
+                DBSession.user_id == payload["user_id"]
+            )
+        ).first()
+
+        if not query_record:
+            raise HTTPException(status_code=404, detail="Query not found")
+
+        return {
+            "query_id":      str(query_id),
+            "question":      query_record.question,
+            "route":         query_record.route,          # "rag" | "web" | "llm"
+            "rag_confidence": query_record.rag_confidence,
+            "sources_used":  query_record.sources_used,
+            "agents_fired": {
+                "rag_agent":  query_record.rag_context is not None,
+                "web_agent":  query_record.web_context is not None,
+                "critic":     query_record.critique is not None,
+            },
+            "context_lengths": {
+                "rag_context_chars": len(query_record.rag_context or ""),
+                "web_context_chars": len(query_record.web_context or ""),
+            },
+            "final_answer_preview": (query_record.final_answer or "")[:200]
+        }
+
+
+# ─────────────────────────────────────────────
+# 4a. GET /users/me  — current user profile
+# ─────────────────────────────────────────────
+@app.get("/users/me", response_model=UserRead)
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    payload = verify_token(credentials.credentials)
+
+    with Session(engine) as db:
+        user = db.exec(
+            select(User).where(User.id == payload["user_id"])
+        ).first()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        return user
+
+
+# ─────────────────────────────────────────────
+# 4b. POST /auth/refresh  — issue a new JWT
+# ─────────────────────────────────────────────
+@app.post("/auth/refresh")
+def refresh_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    # verify_token will raise 401 automatically if token is invalid/expired
+    payload = verify_token(credentials.credentials)
+
+    new_token = create_access_token({
+        "sub":      payload["sub"],
+        "user_id":  payload["user_id"],
+        "username": payload["username"],
+    })
+
+    return {"access_token": new_token, "token_type": "bearer"}
+
+
+# ─────────────────────────────────────────────
+# 5. Health Check
+# ─────────────────────────────────────────────
+@app.get("/health")
+def health_check():
+    checks = {}
+
+    # SQLite
+    try:
+        with Session(engine) as db:
+            db.exec(select(User).limit(1))
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+
+    # ChromaDB
+    try:
+        collections = get_rag_instance().client.list_collections()
+        checks["vector_store"] = f"ok ({len(collections)} collections)"
+    except Exception as e:
+        checks["vector_store"] = f"error: {e}"
+
+    # Embedding model
+    try:
+        get_rag_instance().embedding_model.encode("ping")
+        checks["embedding_model"] = "ok"
+    except Exception as e:
+        checks["embedding_model"] = f"error: {e}"
+
+    overall = "healthy" if all("ok" in v for v in checks.values()) else "degraded"
+
+    return {
+        "status":    overall,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checks":    checks
+    }
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
